@@ -116,7 +116,7 @@ function setupOrderButtons() {
     button.addEventListener("click", () => {
       const product = button.dataset.product;
       const message = encodeURIComponent(`Halo, saya mau pesan ${product}.`);
-      window.open(`https://wa.me/6281234567890?text=${message}`, "_blank", "noopener");
+      window.open(`https://wa.me/6281217291743?text=${message}`, "_blank", "noopener");
     });
   });
 }
@@ -132,7 +132,7 @@ function setupContactForm() {
       `Halo, saya ${name}. Kontak saya: ${contact}. Pesan: ${message}`
     );
 
-    window.open(`https://wa.me/6281234567890?text=${whatsappMessage}`, "_blank", "noopener");
+    window.open(`https://wa.me/6281217291743?text=${whatsappMessage}`, "_blank", "noopener");
     contactForm.reset();
   });
 }
