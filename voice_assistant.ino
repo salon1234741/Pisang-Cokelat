@@ -184,6 +184,9 @@ bool isButtonPressed() {
 // Rekam audio selama tombol ditekan (push-to-talk)
 // =========================================================================
 uint32_t recordWhileButtonHeld() {
+  // Flush stale DMA data yang menumpuk saat idle
+  i2s_zero_dma_buffer(I2S_PORT);
+
   samplesRecorded = 0;
   pcm_filter_dc = 0;
   int32_t i2s_buf[I2S_READ_CHUNK];
