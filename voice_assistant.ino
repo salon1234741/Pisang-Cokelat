@@ -23,6 +23,21 @@ const char* systemInstruction =
 
 #define OLED_PAGE_DELAY 3000  // milidetik per halaman OLED
 
+// =========================================================================
+// 1b. KONFIGURASI WAKE WORD
+// =========================================================================
+// Kata pemicu — device hanya merekam pertanyaan setelah mendengar kata ini
+const char* wakeWords[] = {"halo", "hello", "hai"};
+const int wakeWordCount = 3;
+
+// Durasi rekaman pendek untuk deteksi wake word (dalam detik)
+#define WAKE_RECORD_SECONDS 2
+#define WAKE_BUFFER_SIZE (SAMPLE_RATE * WAKE_RECORD_SECONDS)
+
+// Threshold energi suara — kalau di bawah ini dianggap hening (tidak ada bicara)
+// Sesuaikan nilai ini berdasarkan lingkungan. Nilai lebih tinggi = kurang sensitif.
+#define ENERGY_THRESHOLD 300
+
 WiFiClientSecure secureClient;
 
 // Histori percakapan (4 giliran = hemat RAM & token)
@@ -58,7 +73,11 @@ int32_t pcm_filter_dc = 0;
 // Deklarasi fungsi
 void init_i2s();
 void init_oled();
+void recordAudio(uint32_t maxSamples);
+String sendToWitAIRaw(uint32_t sampleCount);
 String sendToWitAI();
+bool containsWakeWord(const String& text);
+bool listenForWakeWord();
 String askGroq(String userText);
 void addHistory(const char* role, const String& text);
 void oledShowStatus(const char* line1, const char* line2 = "");
@@ -90,31 +109,21 @@ void setup() {
 }
 
 void loop() {
-  oledShowStatus("SIAP MEREKAM", "Silakan bicara...");
+  // Tahap 1: Tunggu wake word ("halo", "hello", "hai")
+  oledShowStatus("Menunggu...", "Bilang 'Halo' dulu");
+  Serial.println("Menunggu wake word...");
 
-  Serial.println("[REC] Mulai...");
-  oledShowStatus(">> BICARA <<", "Merekam...");
-
-  // Bulk I2S read - jauh lebih cepat dari baca per-sample
-  uint32_t samples_recorded = 0;
-  pcm_filter_dc = 0;
-  int32_t i2s_buf[I2S_READ_CHUNK];
-
-  while (samples_recorded < BUFFER_SIZE) {
-    size_t bytes_read = 0;
-    i2s_read(I2S_PORT, i2s_buf, sizeof(i2s_buf), &bytes_read, portMAX_DELAY);
-    int count = bytes_read / sizeof(int32_t);
-
-    for (int j = 0; j < count && samples_recorded < BUFFER_SIZE; j++) {
-      int16_t s = (int16_t)(i2s_buf[j] >> 14);
-      pcm_filter_dc += (s - pcm_filter_dc) >> 2;
-      audioBuffer[samples_recorded++] = s - (int16_t)pcm_filter_dc;
-    }
+  if (!listenForWakeWord()) {
+    return; // tidak terdeteksi, ulangi loop
   }
 
+  // Tahap 2: Wake word terdeteksi — rekam pertanyaan
+  oledShowStatus(">> BICARA <<", "Merekam pertanyaan...");
+  Serial.println("[REC] Merekam pertanyaan...");
+  recordAudio(BUFFER_SIZE);
   Serial.println("[REC] Selesai");
-  oledShowStatus("Memproses...", "Mengirim ke Wit.ai");
 
+  oledShowStatus("Memproses...", "Mengirim ke Wit.ai");
   String userText = sendToWitAI();
 
   if (userText.length() == 0) {
@@ -136,6 +145,86 @@ void loop() {
   } else {
     oledShowStatus("Gagal!", "AI tidak merespons");
     delay(3000);
+  }
+}
+
+// =========================================================================
+// Rekam audio ke audioBuffer (reusable untuk wake word & pertanyaan)
+// =========================================================================
+void recordAudio(uint32_t maxSamples) {
+  uint32_t samples_recorded = 0;
+  pcm_filter_dc = 0;
+  int32_t i2s_buf[I2S_READ_CHUNK];
+
+  while (samples_recorded < maxSamples) {
+    size_t bytes_read = 0;
+    i2s_read(I2S_PORT, i2s_buf, sizeof(i2s_buf), &bytes_read, portMAX_DELAY);
+    int count = bytes_read / sizeof(int32_t);
+
+    for (int j = 0; j < count && samples_recorded < maxSamples; j++) {
+      int16_t s = (int16_t)(i2s_buf[j] >> 14);
+      pcm_filter_dc += (s - pcm_filter_dc) >> 2;
+      audioBuffer[samples_recorded++] = s - (int16_t)pcm_filter_dc;
+    }
+  }
+}
+
+// =========================================================================
+// Deteksi wake word: monitor energi suara, lalu cek via Wit.ai
+// =========================================================================
+bool containsWakeWord(const String& text) {
+  String lower = text;
+  lower.toLowerCase();
+  for (int i = 0; i < wakeWordCount; i++) {
+    if (lower.indexOf(wakeWords[i]) >= 0) return true;
+  }
+  return false;
+}
+
+bool listenForWakeWord() {
+  // Monitor energi suara secara terus-menerus tanpa API call
+  int32_t i2s_buf[I2S_READ_CHUNK];
+  int32_t localDc = 0;
+
+  while (true) {
+    size_t bytes_read = 0;
+    i2s_read(I2S_PORT, i2s_buf, sizeof(i2s_buf), &bytes_read, portMAX_DELAY);
+    int count = bytes_read / sizeof(int32_t);
+
+    // Hitung energi rata-rata dari chunk ini
+    int64_t energy = 0;
+    for (int j = 0; j < count; j++) {
+      int16_t s = (int16_t)(i2s_buf[j] >> 14);
+      localDc += (s - localDc) >> 2;
+      int16_t clean = s - (int16_t)localDc;
+      energy += (int32_t)clean * clean;
+    }
+    int32_t avgEnergy = (count > 0) ? (int32_t)(energy / count) : 0;
+    int16_t rmsLevel = 0;
+    // Aproksimasi sqrt sederhana untuk RMS
+    for (rmsLevel = 0; (int32_t)rmsLevel * rmsLevel < avgEnergy && rmsLevel < 10000; rmsLevel++);
+
+    if (rmsLevel < ENERGY_THRESHOLD) {
+      continue; // masih hening, lanjut monitor
+    }
+
+    // Suara terdeteksi! Rekam clip pendek untuk cek wake word
+    Serial.printf("Suara terdeteksi (RMS=%d), merekam clip pendek...\n", rmsLevel);
+    recordAudio(WAKE_BUFFER_SIZE);
+
+    // Kirim clip pendek ke Wit.ai
+    String detected = sendToWitAIRaw(WAKE_BUFFER_SIZE);
+    Serial.println("Terdeteksi: " + detected);
+
+    if (containsWakeWord(detected)) {
+      Serial.println("Wake word ditemukan!");
+      oledShowStatus("Halo!", "Silakan bertanya...");
+      delay(500);
+      return true;
+    }
+
+    // Bukan wake word, kembali menunggu
+    oledShowStatus("Menunggu...", "Bilang 'Halo' dulu");
   }
 }
 
@@ -300,7 +389,8 @@ void addHistory(const char* role, const String& text) {
 // =========================================================================
 // Wit.ai Speech-to-Text
 // =========================================================================
-String sendToWitAI() {
+// Kirim audio ke Wit.ai dengan jumlah sample tertentu
+String sendToWitAIRaw(uint32_t sampleCount) {
   String finalText = "";
 
   if (WiFi.status() != WL_CONNECTED) {
@@ -314,7 +404,7 @@ String sendToWitAI() {
   http.addHeader("Authorization", String("Bearer ") + witToken);
   http.addHeader("Content-Type", "audio/raw;encoding=signed-integer;bits=16;rate=16000;endian=little");
 
-  uint32_t dataLen = BUFFER_SIZE * sizeof(int16_t);
+  uint32_t dataLen = sampleCount * sizeof(int16_t);
   int httpCode = http.POST((uint8_t*)audioBuffer, dataLen);
 
   if (httpCode == 200 || httpCode == 201) {
@@ -348,6 +438,11 @@ String sendToWitAI() {
 
   http.end();
   return finalText;
+}
+
+// Wrapper: kirim seluruh BUFFER_SIZE ke Wit.ai (untuk pertanyaan)
+String sendToWitAI() {
+  return sendToWitAIRaw(BUFFER_SIZE);
 }
 
 // =========================================================================
