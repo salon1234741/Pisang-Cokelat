@@ -18,7 +18,10 @@ const char* groqModel  = "llama-3.1-8b-instant";
 const char* groqHost   = "api.groq.com";
 
 const char* systemInstruction =
-  "Asisten suara berbahasa Indonesia. Jawab singkat 1-2 kalimat saja.";
+  "Kamu adalah asisten suara ramah berbahasa Indonesia. "
+  "Berikan jawaban yang jelas, detail, dan informatif sekitar 1-2 paragraf pendek.";
+
+#define OLED_PAGE_DELAY 3000  // milidetik per halaman OLED
 
 WiFiClientSecure secureClient;
 
@@ -60,6 +63,7 @@ String askGroq(String userText);
 void addHistory(const char* role, const String& text);
 void oledShowStatus(const char* line1, const char* line2 = "");
 void oledShowWrappedText(const char* title, const String& text);
+void oledShowPaged(const char* title, const String& text);
 
 void setup() {
   Serial.begin(115200);
@@ -128,15 +132,11 @@ void loop() {
 
   if (aiText.length() > 0) {
     Serial.println("AI: " + aiText);
-    String oledText = aiText;
-    if (oledText.length() > 120) {
-      oledText = oledText.substring(0, 117) + "...";
-    }
-    oledShowWrappedText("AI:", oledText);
+    oledShowPaged("AI:", aiText);
   } else {
     oledShowStatus("Gagal!", "AI tidak merespons");
+    delay(3000);
   }
-  delay(3000);
 }
 
 // =========================================================================
@@ -184,19 +184,32 @@ void oledShowStatus(const char* line1, const char* line2) {
   u8g2.sendBuffer();
 }
 
-void oledShowWrappedText(const char* title, const String& text) {
+// Tampilkan teks wrapped dalam satu layar, mulai dari posisi startPos.
+// Return posisi karakter berikutnya (untuk halaman selanjutnya), atau -1 jika sudah habis.
+int oledShowWrappedPage(const char* title, const String& text, int startPos, int page, int totalPages) {
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_6x12_tf);
-  u8g2.drawStr(0, 10, title);
+
+  // Header: title + nomor halaman
+  if (totalPages > 1) {
+    u8g2.drawStr(0, 10, title);
+    String pageInfo = String(page) + "/" + String(totalPages);
+    int pw = pageInfo.length() * 6;
+    u8g2.drawStr(128 - pw, 10, pageInfo.c_str());
+  } else {
+    u8g2.drawStr(0, 10, title);
+  }
   u8g2.drawHLine(0, 13, 128);
 
   const int maxChars = 21; // 128 / 6
   const int lineH = 12;
+  const int maxLines = 3; // 3 baris konten per halaman (y=26,38,50 — sisakan ruang bawah)
   int y = 26;
-  int start = 0;
+  int start = startPos;
   int len = text.length();
+  int linesDrawn = 0;
 
-  while (start < len && y <= 62) {
+  while (start < len && linesDrawn < maxLines) {
     int end = start + maxChars;
     if (end >= len) {
       end = len;
@@ -210,11 +223,60 @@ void oledShowWrappedText(const char* title, const String& text) {
     u8g2.drawStr(0, y, line.c_str());
 
     y += lineH;
+    linesDrawn++;
     start = end;
     while (start < len && text.charAt(start) == ' ') start++;
   }
 
   u8g2.sendBuffer();
+
+  if (start >= len) return -1;
+  return start;
+}
+
+// Hitung jumlah halaman yang dibutuhkan untuk teks
+int countPages(const String& text) {
+  const int maxChars = 21;
+  const int maxLines = 3;
+  int start = 0;
+  int len = text.length();
+  int pages = 0;
+
+  while (start < len) {
+    int linesDrawn = 0;
+    while (start < len && linesDrawn < maxLines) {
+      int end = start + maxChars;
+      if (end >= len) {
+        end = len;
+      } else {
+        int sp = text.lastIndexOf(' ', end);
+        if (sp > start) end = sp;
+      }
+      linesDrawn++;
+      start = end;
+      while (start < len && text.charAt(start) == ' ') start++;
+    }
+    pages++;
+  }
+  return pages > 0 ? pages : 1;
+}
+
+// Tampilkan teks panjang dengan paginasi otomatis
+void oledShowPaged(const char* title, const String& text) {
+  int totalPages = countPages(text);
+  int pos = 0;
+  int page = 1;
+
+  while (pos >= 0) {
+    pos = oledShowWrappedPage(title, text, pos, page, totalPages);
+    delay(OLED_PAGE_DELAY);
+    page++;
+  }
+}
+
+// Tampilkan teks singkat (1 halaman saja, tanpa paginasi)
+void oledShowWrappedText(const char* title, const String& text) {
+  oledShowWrappedPage(title, text, 0, 1, 1);
 }
 
 // =========================================================================
@@ -300,7 +362,7 @@ String askGroq(String userText) {
 
   DynamicJsonDocument reqDoc(4096);
   reqDoc["model"] = groqModel;
-  reqDoc["max_tokens"] = 150;
+  reqDoc["max_tokens"] = 300;
   reqDoc["temperature"] = 0.7;
 
   JsonArray messages = reqDoc.createNestedArray("messages");
