@@ -5,6 +5,7 @@
 #include <Wire.h>
 #include <U8g2lib.h>
 #include <ArduinoJson.h>
+#include <time.h>
 
 // =========================================================================
 // 1. KONFIGURASI WI-FI & API
@@ -21,7 +22,22 @@ const char* systemInstruction =
   "Kamu adalah asisten suara ramah berbahasa Indonesia. "
   "Berikan jawaban yang jelas, detail, dan informatif sekitar 1-2 paragraf pendek.";
 
-#define OLED_PAGE_DELAY 3000  // milidetik per halaman OLED
+#define OLED_PAGE_DELAY 2000  // milidetik per halaman OLED
+
+// =========================================================================
+// 1b. KONFIGURASI NTP
+// =========================================================================
+const char* ntpServer = "pool.ntp.org";
+const long  gmtOffset_sec = 7 * 3600;   // WIB = UTC+7
+const int   daylightOffset_sec = 0;
+
+// =========================================================================
+// 1c. KONFIGURASI TOMBOL
+// =========================================================================
+// GPIO 0 = tombol BOOT bawaan ESP32-S3 (active LOW)
+// Ganti pin ini jika pakai tombol eksternal
+#define BUTTON_PIN 0
+#define BUTTON_ACTIVE LOW  // LOW saat ditekan
 
 WiFiClientSecure secureClient;
 
@@ -47,18 +63,23 @@ U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE, OLED_SCL, OLED_S
 // =========================================================================
 // 3. KONFIGURASI AUDIO
 // =========================================================================
-#define SAMPLE_RATE    16000
-#define RECORD_SECONDS 4
-#define BUFFER_SIZE    (SAMPLE_RATE * RECORD_SECONDS)
-#define I2S_READ_CHUNK 512
+#define SAMPLE_RATE      16000
+#define MAX_RECORD_SEC   10
+#define MAX_BUFFER_SIZE  (SAMPLE_RATE * MAX_RECORD_SEC)
+#define I2S_READ_CHUNK   512
 
 int16_t *audioBuffer = NULL;
+uint32_t samplesRecorded = 0;
 int32_t pcm_filter_dc = 0;
 
 // Deklarasi fungsi
 void init_i2s();
 void init_oled();
-String sendToWitAI();
+void initNTP();
+bool isButtonPressed();
+void showClock();
+uint32_t recordWhileButtonHeld();
+String sendToWitAIRaw(uint32_t sampleCount);
 String askGroq(String userText);
 void addHistory(const char* role, const String& text);
 void oledShowStatus(const char* line1, const char* line2 = "");
@@ -68,10 +89,13 @@ void oledShowPaged(const char* title, const String& text);
 void setup() {
   Serial.begin(115200);
 
+  // Tombol
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
   init_oled();
   oledShowStatus("Booting...");
 
-  audioBuffer = (int16_t *)malloc(BUFFER_SIZE * sizeof(int16_t));
+  audioBuffer = (int16_t *)malloc(MAX_BUFFER_SIZE * sizeof(int16_t));
   if (!audioBuffer) {
     oledShowStatus("ERROR!", "Gagal alokasi RAM");
     while (1);
@@ -83,64 +107,151 @@ void setup() {
     delay(500);
   }
   Serial.println("Wi-Fi Terhubung");
-  oledShowStatus("WiFi Tersambung", "Siap digunakan");
+  oledShowStatus("WiFi Tersambung");
 
   secureClient.setInsecure();
   init_i2s();
+  initNTP();
 }
 
 void loop() {
-  oledShowStatus("SIAP MEREKAM", "Silakan bicara...");
+  // Idle: tampilkan jam NTP
+  // Cek tombol setiap iterasi
+  if (isButtonPressed()) {
+    // Debounce
+    delay(50);
+    if (!isButtonPressed()) return;
 
-  Serial.println("[REC] Mulai...");
-  oledShowStatus(">> BICARA <<", "Merekam...");
+    // Tombol ditekan — mulai rekam
+    oledShowStatus(">> BICARA <<", "Lepas untuk kirim");
+    Serial.println("[REC] Tombol ditekan, merekam...");
 
-  // Bulk I2S read - jauh lebih cepat dari baca per-sample
-  uint32_t samples_recorded = 0;
+    uint32_t recorded = recordWhileButtonHeld();
+
+    if (recorded < SAMPLE_RATE / 2) {
+      // Kurang dari 0.5 detik — terlalu pendek
+      oledShowStatus("Terlalu pendek", "Tahan lebih lama");
+      delay(1500);
+      return;
+    }
+
+    Serial.printf("[REC] Selesai, %d samples (%.1f detik)\n", recorded, (float)recorded / SAMPLE_RATE);
+    oledShowStatus("Memproses...", "Mengirim ke Wit.ai");
+
+    String userText = sendToWitAIRaw(recorded);
+
+    if (userText.length() == 0) {
+      oledShowStatus("Tidak dikenali", "Coba lagi...");
+      delay(1500);
+      return;
+    }
+
+    Serial.println("User: " + userText);
+    oledShowWrappedText("Kamu:", userText);
+    delay(1000);
+
+    oledShowStatus("AI berpikir...");
+    String aiText = askGroq(userText);
+
+    if (aiText.length() > 0) {
+      Serial.println("AI: " + aiText);
+      oledShowPaged("AI:", aiText);
+    } else {
+      oledShowStatus("Gagal!", "AI tidak merespons");
+      delay(3000);
+    }
+    return;
+  }
+
+  // Tidak ada tombol ditekan — tampilkan jam
+  showClock();
+  delay(500);
+}
+
+// =========================================================================
+// Tombol
+// =========================================================================
+bool isButtonPressed() {
+  return digitalRead(BUTTON_PIN) == BUTTON_ACTIVE;
+}
+
+// =========================================================================
+// Rekam audio selama tombol ditekan (push-to-talk)
+// =========================================================================
+uint32_t recordWhileButtonHeld() {
+  samplesRecorded = 0;
   pcm_filter_dc = 0;
   int32_t i2s_buf[I2S_READ_CHUNK];
 
-  while (samples_recorded < BUFFER_SIZE) {
+  while (isButtonPressed() && samplesRecorded < MAX_BUFFER_SIZE) {
     size_t bytes_read = 0;
     i2s_read(I2S_PORT, i2s_buf, sizeof(i2s_buf), &bytes_read, portMAX_DELAY);
     int count = bytes_read / sizeof(int32_t);
 
-    for (int j = 0; j < count && samples_recorded < BUFFER_SIZE; j++) {
+    for (int j = 0; j < count && samplesRecorded < MAX_BUFFER_SIZE; j++) {
       int16_t s = (int16_t)(i2s_buf[j] >> 14);
       pcm_filter_dc += (s - pcm_filter_dc) >> 2;
-      audioBuffer[samples_recorded++] = s - (int16_t)pcm_filter_dc;
+      audioBuffer[samplesRecorded++] = s - (int16_t)pcm_filter_dc;
     }
   }
 
-  Serial.println("[REC] Selesai");
-  oledShowStatus("Memproses...", "Mengirim ke Wit.ai");
-
-  String userText = sendToWitAI();
-
-  if (userText.length() == 0) {
-    oledShowStatus("Tidak dikenali", "Coba lagi...");
-    delay(1500);
-    return;
-  }
-
-  Serial.println("User: " + userText);
-  oledShowWrappedText("Kamu:", userText);
-  delay(1000);
-
-  oledShowStatus("AI berpikir...");
-  String aiText = askGroq(userText);
-
-  if (aiText.length() > 0) {
-    Serial.println("AI: " + aiText);
-    oledShowPaged("AI:", aiText);
-  } else {
-    oledShowStatus("Gagal!", "AI tidak merespons");
-    delay(3000);
-  }
+  return samplesRecorded;
 }
 
 // =========================================================================
-// I2S - DMA buffer lebih besar untuk efisiensi
+// NTP & Jam
+// =========================================================================
+void initNTP() {
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  Serial.println("NTP dikonfigurasi (WIB UTC+7)");
+}
+
+void showClock() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    oledShowStatus("Jam", "Sinkronisasi NTP...");
+    return;
+  }
+
+  char timeBuf[9];   // "HH:MM:SS"
+  char dateBuf[20];  // "Sen, 01 Jul 2026"
+
+  strftime(timeBuf, sizeof(timeBuf), "%H:%M:%S", &timeinfo);
+
+  // Nama hari Indonesia
+  const char* hariID[] = {"Min", "Sen", "Sel", "Rab", "Kam", "Jum", "Sab"};
+  const char* bulanID[] = {"Jan", "Feb", "Mar", "Apr", "Mei", "Jun",
+                           "Jul", "Agu", "Sep", "Okt", "Nov", "Des"};
+
+  snprintf(dateBuf, sizeof(dateBuf), "%s, %02d %s %04d",
+           hariID[timeinfo.tm_wday],
+           timeinfo.tm_mday,
+           bulanID[timeinfo.tm_mon],
+           timeinfo.tm_year + 1900);
+
+  u8g2.clearBuffer();
+
+  // Jam besar di tengah
+  u8g2.setFont(u8g2_font_logisoso22_tn);
+  int timeW = u8g2.getStrWidth(timeBuf);
+  u8g2.drawStr((128 - timeW) / 2, 30, timeBuf);
+
+  // Tanggal di bawah
+  u8g2.setFont(u8g2_font_6x12_tf);
+  int dateW = u8g2.getStrWidth(dateBuf);
+  u8g2.drawStr((128 - dateW) / 2, 48, dateBuf);
+
+  // Hint tombol
+  u8g2.setFont(u8g2_font_5x7_tf);
+  const char* hint = "Tekan tombol utk bicara";
+  int hintW = u8g2.getStrWidth(hint);
+  u8g2.drawStr((128 - hintW) / 2, 62, hint);
+
+  u8g2.sendBuffer();
+}
+
+// =========================================================================
+// I2S
 // =========================================================================
 void init_i2s() {
   i2s_config_t i2s_config = {
@@ -184,13 +295,10 @@ void oledShowStatus(const char* line1, const char* line2) {
   u8g2.sendBuffer();
 }
 
-// Tampilkan teks wrapped dalam satu layar, mulai dari posisi startPos.
-// Return posisi karakter berikutnya (untuk halaman selanjutnya), atau -1 jika sudah habis.
 int oledShowWrappedPage(const char* title, const String& text, int startPos, int page, int totalPages) {
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_6x12_tf);
 
-  // Header: title + nomor halaman
   if (totalPages > 1) {
     u8g2.drawStr(0, 10, title);
     String pageInfo = String(page) + "/" + String(totalPages);
@@ -201,9 +309,9 @@ int oledShowWrappedPage(const char* title, const String& text, int startPos, int
   }
   u8g2.drawHLine(0, 13, 128);
 
-  const int maxChars = 21; // 128 / 6
+  const int maxChars = 21;
   const int lineH = 12;
-  const int maxLines = 3; // 3 baris konten per halaman (y=26,38,50 — sisakan ruang bawah)
+  const int maxLines = 3;
   int y = 26;
   int start = startPos;
   int len = text.length();
@@ -234,7 +342,6 @@ int oledShowWrappedPage(const char* title, const String& text, int startPos, int
   return start;
 }
 
-// Hitung jumlah halaman yang dibutuhkan untuk teks
 int countPages(const String& text) {
   const int maxChars = 21;
   const int maxLines = 3;
@@ -261,7 +368,6 @@ int countPages(const String& text) {
   return pages > 0 ? pages : 1;
 }
 
-// Tampilkan teks panjang dengan paginasi otomatis
 void oledShowPaged(const char* title, const String& text) {
   int totalPages = countPages(text);
   int pos = 0;
@@ -274,7 +380,6 @@ void oledShowPaged(const char* title, const String& text) {
   }
 }
 
-// Tampilkan teks singkat (1 halaman saja, tanpa paginasi)
 void oledShowWrappedText(const char* title, const String& text) {
   oledShowWrappedPage(title, text, 0, 1, 1);
 }
@@ -300,7 +405,7 @@ void addHistory(const char* role, const String& text) {
 // =========================================================================
 // Wit.ai Speech-to-Text
 // =========================================================================
-String sendToWitAI() {
+String sendToWitAIRaw(uint32_t sampleCount) {
   String finalText = "";
 
   if (WiFi.status() != WL_CONNECTED) {
@@ -314,13 +419,12 @@ String sendToWitAI() {
   http.addHeader("Authorization", String("Bearer ") + witToken);
   http.addHeader("Content-Type", "audio/raw;encoding=signed-integer;bits=16;rate=16000;endian=little");
 
-  uint32_t dataLen = BUFFER_SIZE * sizeof(int16_t);
+  uint32_t dataLen = sampleCount * sizeof(int16_t);
   int httpCode = http.POST((uint8_t*)audioBuffer, dataLen);
 
   if (httpCode == 200 || httpCode == 201) {
     String response = http.getString();
 
-    // Ambil objek JSON terakhir yang valid (Wit.ai kirim partial results)
     int searchPos = 0;
     while (true) {
       int braceStart = response.indexOf('{', searchPos);
