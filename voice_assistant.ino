@@ -212,11 +212,25 @@ uint32_t recordWhileButtonHeld() {
 void initNTP() {
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
   Serial.println("NTP dikonfigurasi (WIB UTC+7)");
+
+  // Tunggu sinkronisasi NTP pertama kali (max 10 detik)
+  oledShowStatus("Sinkronisasi", "Jam NTP...");
+  struct tm timeinfo;
+  int retries = 0;
+  while (!getLocalTime(&timeinfo, 1000) && retries < 10) {
+    Serial.print(".");
+    retries++;
+  }
+  if (retries < 10) {
+    Serial.println("\nNTP tersinkronisasi!");
+  } else {
+    Serial.println("\nNTP belum sinkron, akan coba lagi nanti.");
+  }
 }
 
 void showClock() {
   struct tm timeinfo;
-  if (!getLocalTime(&timeinfo)) {
+  if (!getLocalTime(&timeinfo, 100)) {
     oledShowStatus("Jam", "Sinkronisasi NTP...");
     return;
   }
