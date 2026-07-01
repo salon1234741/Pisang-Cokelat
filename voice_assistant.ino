@@ -64,7 +64,7 @@ U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE, OLED_SCL, OLED_S
 // 3. KONFIGURASI AUDIO
 // =========================================================================
 #define SAMPLE_RATE      16000
-#define MAX_RECORD_SEC   10
+#define MAX_RECORD_SEC   5
 #define MAX_BUFFER_SIZE  (SAMPLE_RATE * MAX_RECORD_SEC)
 #define I2S_READ_CHUNK   512
 
@@ -95,11 +95,16 @@ void setup() {
   init_oled();
   oledShowStatus("Booting...");
 
-  audioBuffer = (int16_t *)malloc(MAX_BUFFER_SIZE * sizeof(int16_t));
+  // Coba PSRAM dulu (ESP32-S3 biasanya punya), fallback ke RAM biasa
+  audioBuffer = (int16_t *)ps_malloc(MAX_BUFFER_SIZE * sizeof(int16_t));
+  if (!audioBuffer) {
+    audioBuffer = (int16_t *)malloc(MAX_BUFFER_SIZE * sizeof(int16_t));
+  }
   if (!audioBuffer) {
     oledShowStatus("ERROR!", "Gagal alokasi RAM");
     while (1);
   }
+  Serial.printf("Audio buffer: %d KB\n", (MAX_BUFFER_SIZE * sizeof(int16_t)) / 1024);
 
   oledShowStatus("Menghubungkan", "WiFi...");
   WiFi.begin(ssid, password);
